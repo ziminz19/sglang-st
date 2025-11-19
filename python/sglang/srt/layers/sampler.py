@@ -3,8 +3,6 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from torch import nn
-
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -14,6 +12,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda
+from torch import nn
 
 if is_cuda():
     from sgl_kernel import (
@@ -66,6 +65,15 @@ class Sampler(nn.Module):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
+        # ==========
+        # begin of soft thinking
+        # ==========
+        enable_soft_thinking: bool = False,
+        add_noise_dirichlet: bool = False,
+        add_noise_gumbel_softmax: bool = False,
+        # ==========
+        # end of soft thinking
+        # ==========
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -91,6 +99,31 @@ class Sampler(nn.Module):
             batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+            # ==========
+            # begin of soft thinking
+            # ==========
+            if enable_soft_thinking:
+                # logits_output.topk_probs, logits_output.topk_indices
+                # logits.div_(sampling_info.temperatures)
+                # logits[:] = torch.softmax(logits, dim=-1)
+                # probs = logits
+                # del logits
+                # # determine how many top-k to keep (at least 1)
+                # # 只用argmax，不用topk以提升速度
+                # max_k = max(1, sampling_info.max_topk if sampling_info.max_topk is not None else 1)
+                # logits_output.topk_probs = torch.zeros(probs.shape[0], max_k, dtype=probs.dtype, device=probs.device)
+                # logits_output.topk_indices = torch.zeros(probs.shape[0], max_k, dtype=torch.long, device=probs.device)
+
+                # # 取对应位置的概率，其余为0
+                # logits_output.topk_probs[:, 0] = torch.gather(probs, 1, batch_next_token_ids.unsqueeze(1)).squeeze(1)
+                logits_output.topk_probs[:, 0] = 1
+                logits_output.topk_indices[:, 0] = batch_next_token_ids
+            else:
+                pass
+            # ==========
+            # end of soft thinking
+            # ==========
         else:
             can_sample_directly_from_probs = (
                 not sampling_info.need_top_p_sampling
@@ -125,20 +158,125 @@ class Sampler(nn.Module):
                 )
             else:
                 if get_global_server_args().sampling_backend == "flashinfer":
-                    if sampling_info.need_min_p_sampling:
-                        probs = top_k_renorm_prob(probs, sampling_info.top_ks)
-                        probs = top_p_renorm_prob(probs, sampling_info.top_ps)
-                        batch_next_token_ids = min_p_sampling_from_probs(
-                            probs, sampling_info.min_ps
+                    # ==========
+                    # begin of soft thinking
+                    # ==========
+                    if enable_soft_thinking:
+                        # calculate the entropy
+                        entropy = -torch.sum(
+                            probs * torch.log(probs.clamp(min=1e-12)), dim=-1
                         )
-                    else:
-                        batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                            probs.contiguous(),
-                            sampling_info.top_ks,
+                        soft_mask = sampling_info.soft_thinking_modes  # Shape (B,)
+                        top_ps = torch.where(
+                            soft_mask,
                             sampling_info.top_ps,
-                            filter_apply_order="joint",
-                            check_nan=self.use_nan_detection,
+                            sampling_info.after_thinking_top_ps,
                         )
+                        top_ks = torch.where(
+                            soft_mask,
+                            sampling_info.top_ks,
+                            sampling_info.after_thinking_top_ks,
+                        )
+                        min_ps = torch.where(
+                            soft_mask,
+                            sampling_info.min_ps,
+                            sampling_info.after_thinking_min_ps,
+                        )
+                        dirichlet_alphas = sampling_info.dirichlet_alphas
+
+                        # top k top p renorm
+                        probs = top_k_renorm_prob(probs, top_ks)
+                        probs = top_p_renorm_prob(probs, top_ps)
+
+                        # minp renorm
+                        if (
+                            sampling_info.need_min_p_sampling
+                            or sampling_info.need_after_thinking_min_p_sampling
+                        ):  # slow
+                            max_prob = probs.max(dim=-1, keepdim=True).values
+                            min_p_thresholds = max_prob * min_ps.view(-1, 1)
+                            min_p_mask = probs < min_p_thresholds
+                            probs.masked_fill_(min_p_mask, 0.0)
+                            probs = probs / probs.sum(dim=-1, keepdim=True)
+
+                        # dirichlet noise (not used in paper)
+                        if add_noise_dirichlet:  # slow
+                            conc = probs[soft_mask] * dirichlet_alphas[soft_mask].view(
+                                -1, 1
+                            )
+                            gamma_dist = torch.distributions.Gamma(
+                                conc, torch.ones_like(conc)
+                            )
+                            gamma_samples = gamma_dist.sample()
+                            probs_new = gamma_samples / gamma_samples.sum(
+                                dim=-1, keepdim=True
+                            )
+                            probs[soft_mask] = probs_new
+
+                        # max top k
+                        topk_probs, topk_indices = torch.topk(
+                            probs, k=sampling_info.max_topk, dim=-1
+                        )  # slow
+                        topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True))
+
+                        # gumbel softmax noise (not used in paper)
+                        if add_noise_gumbel_softmax:  # slow
+                            topk_logits = torch.log(topk_probs)
+                            gumbels = (
+                                -torch.empty_like(topk_logits).exponential_().log()
+                            )  # ~Gumbel(0,1)
+                            gumbels = (
+                                (topk_logits + gumbels)
+                                / sampling_info.gumbel_softmax_temperatures
+                            )  # ~Gumbel(logits,tau)
+                            topk_probs = gumbels.softmax(-1)
+                            # topk_probs = F.gumbel_softmax(topk_logits, tau=sampling_info.dirichlet_alphas) # use dirichlet alpha as temperature
+                            # sort the topk token according to new probability
+                            sorted_weights, sorted_idx = torch.sort(
+                                topk_probs, dim=-1, descending=True
+                            )
+                            topk_probs = sorted_weights
+                            topk_indices = torch.gather(
+                                topk_indices, dim=1, index=sorted_idx
+                            )
+
+                        # after thinking sampling
+                        non_soft_mask = ~soft_mask
+                        if any(non_soft_mask):
+                            sampled_token_ids = torch.multinomial(probs, num_samples=1)
+
+                            # For rows where soft_thinking_modes is False
+                            topk_probs[non_soft_mask] = 0.0
+                            topk_indices[non_soft_mask] = 0
+
+                            # Assign the first element of each row to sampled_token_ids and set it to 1.0 in topk_probs
+                            topk_probs[non_soft_mask, 0] = 1.0
+                            topk_indices[non_soft_mask, 0] = sampled_token_ids[
+                                non_soft_mask
+                            ].view(-1)
+
+                        logits_output.topk_probs = topk_probs
+                        logits_output.topk_indices = topk_indices
+                        logits_output.entropy = entropy
+                        batch_next_token_ids = topk_indices[:, 0].to(torch.int32)
+                    # ==========
+                    # end of soft thinking
+                    # ==========
+                    else:
+                        if sampling_info.need_min_p_sampling:
+                            probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                            probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                            batch_next_token_ids = min_p_sampling_from_probs(
+                                probs, sampling_info.min_ps
+                            )
+                        else:
+                            batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                                probs.contiguous(),
+                                sampling_info.top_ks,
+                                sampling_info.top_ps,
+                                filter_apply_order="joint",
+                                check_nan=self.use_nan_detection,
+                            )
                 elif get_global_server_args().sampling_backend == "pytorch":
                     # A slower fallback implementation with torch native operations.
                     batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
@@ -156,17 +294,30 @@ class Sampler(nn.Module):
                     )
 
             if return_logprob:
-                if get_global_server_args().rl_on_policy_target == "fsdp":
-                    logprobs = logprobs_via_logsoftmax_kernel
-                    del logprobs_via_logsoftmax_kernel
-                # clamp to avoid -inf
-                elif SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = torch.log(probs_without_temp_scaling).clamp(
-                        min=torch.finfo(probs_without_temp_scaling.dtype).min
-                    )
-                    del probs_without_temp_scaling
+                ## Seperate return logprob logic for soft-thinking and discrete thinking. Maybe this is unnecessary
+                # ==========
+                # begin of soft thinking
+                # ==========
+                if enable_soft_thinking:
+                    # TODO: Need revision to decide what logprob should be returned under soft thinking mode
+                    pass
+                # ==========
+                # end of soft thinking
+                # ==========
                 else:
-                    logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
+                    if get_global_server_args().rl_on_policy_target == "fsdp":
+                        logprobs = logprobs_via_logsoftmax_kernel
+                        del logprobs_via_logsoftmax_kernel
+                    # clamp to avoid -inf
+                    elif SGLANG_RETURN_ORIGINAL_LOGPROB:
+                        logprobs = torch.log(probs_without_temp_scaling).clamp(
+                            min=torch.finfo(probs_without_temp_scaling.dtype).min
+                        )
+                        del probs_without_temp_scaling
+                    else:
+                        logprobs = torch.log(probs).clamp(
+                            min=torch.finfo(probs.dtype).min
+                        )
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:

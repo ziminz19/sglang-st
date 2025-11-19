@@ -20,8 +20,6 @@ from typing import List, Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
-from torch import nn
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -48,6 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu, use_intel_amx_backend
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +97,15 @@ class LogitsProcessorOutput:
         None
     )
     input_token_ids_logprobs_idx: Optional[List] = None
+
+    # ==========
+    # begin of soft thinking
+    # ==========
+    topk_probs: Optional[torch.Tensor] = None
+    topk_indices: Optional[torch.Tensor] = None
+    # ==========
+    # end of soft thinking
+    # ==========
 
 
 @dataclasses.dataclass
@@ -194,7 +202,6 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_attention_dp_rank()
         if dp_rank == 0:

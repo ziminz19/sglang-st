@@ -20,8 +20,6 @@ from enum import Enum, IntEnum, auto
 from typing import Any, List, Optional, Set, Union
 
 import torch
-from transformers import PretrainedConfig
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -34,6 +32,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_sparse_attention_config,
 )
 from sglang.utils import is_in_ci
+from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +96,14 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
+        # ==========
+        # begin of soft thinking
+        # ==========
+        enable_soft_thinking: Optional[bool] = None,
+        max_topk: Optional[int] = None,
+        # ==========
+        # end of soft thinking
+        # ==========
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -212,6 +219,15 @@ class ModelConfig:
         self.is_matryoshka = self.matryoshka_dimensions or getattr(
             self.hf_config, "is_matryoshka", False
         )
+
+        # ==========
+        # begin of soft thinking
+        # ==========
+        self.enable_soft_thinking = enable_soft_thinking
+        self.max_topk = max_topk
+        # ==========
+        # end of soft thinking
+        # ==========
 
     @staticmethod
     def from_server_args(

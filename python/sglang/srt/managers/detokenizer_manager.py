@@ -23,7 +23,6 @@ from typing import Dict, List, Union
 import psutil
 import setproctitle
 import zmq
-
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchMultimodalDecodeReq,
@@ -281,6 +280,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             forward_entry_time=recv_obj.forward_entry_time,
             prefill_delay=recv_obj.prefill_delay,
             prefill_latency=recv_obj.prefill_latency,
+            # ==========
+            # begin of soft thinking
+            # ==========
+            output_topk_probs_list=recv_obj.output_topk_probs_list,
+            output_topk_indices_list=recv_obj.output_topk_indices_list,
+            # ==========
+            # end of soft thinking
+            # ==========
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):

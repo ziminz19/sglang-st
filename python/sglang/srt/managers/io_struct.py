@@ -922,6 +922,16 @@ class BatchTokenIDOutput(
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
+    # ==========
+    # begin of soft thinking
+    # ==========
+    # Soft thinking
+    output_topk_probs_list: List[List[List[float]]]
+    output_topk_indices_list: List[List[List[int]]]
+    # ==========
+    # end of soft thinking
+    # ==========
+
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq, RequestTimingMetricsMixin):
@@ -1000,6 +1010,15 @@ class BatchStrOutput(
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # ==========
+    # begin of soft thinking
+    # ==========
+    output_topk_probs_list: List[List[List[float]]]
+    output_topk_indices_list: List[List[List[int]]]
+    # ==========
+    # end of soft thinking
+    # ==========
 
 
 @dataclass

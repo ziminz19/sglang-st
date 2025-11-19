@@ -31,10 +31,6 @@ import setproctitle
 import torch
 import torch.distributed
 import zmq
-from torch.cuda import Stream as CudaStream
-from torch.cuda import StreamContext as CudaStreamContext
-from torch.distributed import barrier
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
@@ -193,6 +189,9 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from torch.cuda import Stream as CudaStream
+from torch.cuda import StreamContext as CudaStreamContext
+from torch.distributed import barrier
 
 logger = logging.getLogger(__name__)
 
@@ -567,6 +566,15 @@ class Scheduler(
                 (GetLoadReqInput, self.get_load),
             ]
         )
+
+        # ==========
+        # begin of soft thinking
+        # ==========
+        self.enable_soft_thinking = server_args.enable_soft_thinking
+        self.max_topk = server_args.max_topk
+        # ==========
+        # end of soft thinking
+        # ==========
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
@@ -1252,6 +1260,14 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
+                # ==========
+                # begin of soft thinking
+                # ==========
+                enable_soft_thinking=self.enable_soft_thinking,
+                max_topk=self.max_topk,
+                # ==========
+                # end of soft thinking
+                # ==========
             )
             req.tokenizer = self.tokenizer
 
@@ -1765,7 +1781,6 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-
             if self.enable_lora and not self.tp_worker.can_run_lora_batch(
                 lora_set
                 | set([req.lora_id for req in adder.can_run_list])
