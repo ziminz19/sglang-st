@@ -25,7 +25,11 @@ install: submodule ## Install package in development mode
 	@pip install -e . --no-build-isolation
 
 build: install-deps submodule ## Build and install wheel package
-	@rm -rf dist/* || true && CMAKE_POLICY_VERSION_MINIMUM=3.5 MAX_JOBS=$(nproc) CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation && pip3 install dist/*whl --force-reinstall --no-deps
+	@rm -rf dist/* || true && \
+	export Torch_DIR=$(python -c "import torch; print(torch.utils.cmake_prefix_path + '/Torch')") && \
+	export CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}} && \
+	CMAKE_POLICY_VERSION_MINIMUM=3.5 MAX_JOBS=16 CMAKE_BUILD_PARALLEL_LEVEL=16 uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation && \
+	pip3 install dist/*whl --force-reinstall --no-deps
 
 clean: ## Remove build artifacts
 	@rm -rf build dist *.egg-info
