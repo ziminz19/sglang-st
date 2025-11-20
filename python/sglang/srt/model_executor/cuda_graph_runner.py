@@ -26,8 +26,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
-from torch.profiler import ProfilerActivity, profile
-
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -67,6 +65,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from torch.profiler import ProfilerActivity, profile
 
 try:
     from kt_kernel import AMXMoEWrapper
@@ -298,25 +297,51 @@ class CudaGraphRunner:
         if self.enable_torch_compile:
             set_torch_compile_config()
 
+        # ==========
+        # begin of soft thinking
+        # ==========
+        self.enable_soft_thinking = model_runner.server_args.enable_soft_thinking
+        if self.enable_soft_thinking:
+            self.max_topk = model_runner.server_args.max_topk
+        # ==========
+        # end of soft thinking
+        # ==========
+
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
 
         # Graph inputs
         with torch.device(self.device):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            # ==========
+            # begin of soft thinking
+            # ==========
+            self.input_ids = (
+                None
+                if self.enable_soft_thinking
+                else torch.zeros((self.max_num_token,), dtype=torch.int64)
+            )
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.out_cache_loc = torch.zeros(
-                (self.max_num_token,), dtype=self._cache_loc_dtype()
-            )
+            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros(
-                (3, self.max_num_token), dtype=torch.int64
-            )
+            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
+            self.topk_probs = (
+                torch.zeros((self.max_bs, self.max_topk), dtype=self.model_runner.dtype)
+                if self.enable_soft_thinking
+                else None
+            )
+            self.topk_indices = (
+                torch.zeros((self.max_bs, self.max_topk), dtype=torch.int64)
+                if self.enable_soft_thinking
+                else None
+            )
+            # ==========
+            # end of soft thinking
+            # ==================
 
             # pipeline parallelism
             if self.pp_size > 1:
@@ -461,9 +486,10 @@ class CudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
+        with (
+            freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
+            graph_capture() as graph_capture_context,
+        ):
             with profile_context as prof:
                 self.stream = graph_capture_context.stream
                 avail_mem = get_available_gpu_memory(
@@ -543,7 +569,21 @@ class CudaGraphRunner:
         num_tokens = bs * self.num_tokens_per_bs
 
         # Graph inputs
-        input_ids = self.input_ids[:num_tokens]
+        # ==========
+        # begin of soft thinking
+        # ==========
+        if self.enable_soft_thinking:
+            input_ids = None
+            topk_probs = self.topk_probs[:bs]
+            topk_indices = self.topk_indices[:bs]
+        else:
+            input_ids = self.input_ids[:num_tokens]
+            topk_probs = None
+            topk_indices = None
+        # ==========
+        # end of soft thinking
+        # ==========
+
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
         seq_lens_cpu = self.seq_lens_cpu[:bs]
@@ -599,10 +639,18 @@ class CudaGraphRunner:
             global_dp_buffer_len = None
 
         spec_info = self.get_spec_info(num_tokens)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
+        # ==========
+        # begin of soft thinking
+        # ==========
+        if self.enable_soft_thinking:
+            self.capture_hidden_mode = CaptureHiddenMode.LAST
+        elif self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
+        # ==========
+        # end of soft thinking
+        # ==========
 
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -639,6 +687,14 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            # ==========
+            # begin of soft thinking
+            # ==========
+            topk_probs=topk_probs,
+            topk_indices=topk_indices,
+            # ==========
+            # end of soft thinking
+            # ==========
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -702,17 +758,25 @@ class CudaGraphRunner:
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
-
         # If the required capture_hidden_mode changes, we need to recapture the graph
 
         # These are the different factors that can influence the capture_hidden_mode
         capture_hidden_mode_required_by_forward_batch = (
             forward_batch.capture_hidden_mode
         )
-        capture_hidden_mode_required_by_spec_info = (
-            getattr(forward_batch.spec_info, "capture_hidden_mode", None)
-            or CaptureHiddenMode.NULL
-        )
+        # ==========
+        # begin of soft thinking
+        # ==========
+        if self.enable_soft_thinking:
+            capture_hidden_mode_required_by_spec_info = CaptureHiddenMode.LAST
+        else:
+            capture_hidden_mode_required_by_spec_info = (
+                getattr(forward_batch.spec_info, "capture_hidden_mode", None)
+                or CaptureHiddenMode.NULL
+            )
+        # ==========
+        # end of soft thinking
+        # ==========
         capture_hidden_mode_required_for_returning_hidden_states = (
             CaptureHiddenMode.FULL
             if self.model_runner.server_args.enable_return_hidden_states
@@ -760,7 +824,17 @@ class CudaGraphRunner:
             self.out_cache_loc.zero_()
 
         # Common inputs
-        self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+        # ==========
+        # begin of soft thinking
+        # ==========
+        if self.enable_soft_thinking:
+            self.topk_probs[:raw_bs].copy_(forward_batch.topk_probs)
+            self.topk_indices[:raw_bs].copy_(forward_batch.topk_indices)
+        else:
+            self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+        # ==========
+        # end of soft thinking
+        # ==========
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
@@ -835,7 +909,18 @@ class CudaGraphRunner:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
-            self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+            # ==========
+            # begin of soft thinking
+            # ==========
+            if self.enable_soft_thinking:
+                bs = forward_batch.batch_size
+                self.topk_probs[:bs].copy_(forward_batch.topk_probs)
+                self.topk_indices[:bs].copy_(forward_batch.topk_indices)
+            else:
+                self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+            # ==========
+            # end of soft thinking
+            # ==========
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay

@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """A tensor parallel worker."""
+
 from __future__ import annotations
 
 import logging
@@ -19,7 +20,6 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
 import torch
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
@@ -157,7 +157,6 @@ class BaseTpWorker(ABC):
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-
         monkey_patch_torch_reductions()
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
@@ -232,6 +231,14 @@ class TpModelWorker(BaseTpWorker):
                 else server_args.speculative_draft_model_revision
             ),
             is_draft_model=is_draft_worker,
+            # ==========
+            # begin of soft thinking
+            # ==========
+            enable_soft_thinking=server_args.enable_soft_thinking,
+            max_topk=server_args.max_topk,
+            # ==========
+            # end of soft thinking
+            # ==========
         )
 
         self._model_runner = ModelRunner(
@@ -289,17 +296,17 @@ class TpModelWorker(BaseTpWorker):
         )
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_queued_requests = server_args.max_queued_requests
-        assert (
-            self.max_queued_requests is None or self.max_queued_requests >= 1
-        ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
+        assert self.max_queued_requests is None or self.max_queued_requests >= 1, (
+            "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
+        )
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
-        assert (
-            self.max_req_len > 0 and self.max_req_input_len > 0
-        ), "Memory pool size is too small"
+        assert self.max_req_len > 0 and self.max_req_input_len > 0, (
+            "Memory pool size is too small"
+        )
 
         # Sync random seed across TP workers
         self.random_seed = broadcast_pyobj(

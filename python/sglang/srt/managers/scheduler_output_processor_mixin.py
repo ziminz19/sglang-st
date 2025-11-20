@@ -5,7 +5,6 @@ import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -166,6 +165,15 @@ class SchedulerOutputProcessorMixin:
                             )
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
+
+                    # ==========
+                    # begin of soft thinking
+                    # ==========
+                    if self.enable_soft_thinking:
+                        req.update_topk_info(logits_output, i)
+                    # ==========
+                    # end of soft thinking
+                    # ==========
 
                     trace_slice(
                         RequestStage.PREFILL_FORWARD,
@@ -417,6 +425,15 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
+
+            # ==========
+            # begin of soft thinking
+            # ==========
+            if self.enable_soft_thinking:
+                req.update_topk_info(logits_output, i)
+            # ==========
+            # end of soft thinking
+            # ==========
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -790,6 +807,16 @@ class SchedulerOutputProcessorMixin:
                 output_token_ids_logprobs_idx
             ) = None
 
+        # ==========
+        # begin of soft thinking
+        # ==========
+        # Always initialize soft thinking output lists so they exist regardless of flag
+        output_topk_probs_list = []
+        output_topk_indices_list = []
+        # ==========
+        # end of soft thinking
+        # ==========
+
         for req in reqs:
             if req is skip_req:
                 continue
@@ -965,6 +992,16 @@ class SchedulerOutputProcessorMixin:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
 
+                # ==========
+                # begin of soft thinking
+                # ==========
+                if self.enable_soft_thinking:
+                    output_topk_probs_list.append(req.get_output_topk_prob_list())
+                    output_topk_indices_list.append(req.get_output_topk_idx_list())
+                # ==========
+                # end of soft thinking
+                # ==========
+
             if (
                 req.finished()
                 and self.tp_rank == 0
@@ -1015,6 +1052,14 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
+                    # ==========
+                    # begin of soft thinking
+                    # ==========
+                    output_topk_probs_list=output_topk_probs_list,
+                    output_topk_indices_list=output_topk_indices_list,
+                    # ==========
+                    # end of soft thinking
+                    # ==========
                 )
             )
 

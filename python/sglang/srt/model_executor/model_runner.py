@@ -28,7 +28,6 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs import (
     FalconH1Config,
     KimiLinearConfig,
@@ -320,6 +319,16 @@ class ModelRunner:
 
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
+
+        # ==========
+        # begin of soft thinking
+        # ==========
+        self.enable_soft_thinking = server_args.enable_soft_thinking
+        self.add_noise_dirichlet = server_args.add_noise_dirichlet
+        self.add_noise_gumbel_softmax = server_args.add_noise_gumbel_softmax
+        # ==========
+        # end of soft thinking
+        # ==========
 
         # Temporary cached values
         self.support_pp = (
@@ -933,15 +942,15 @@ class ModelRunner:
         group_name,
         backend="nccl",
     ):
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
+        assert torch.distributed.is_initialized(), (
+            "Default torch process group must be initialized"
+        )
         assert group_name != "", "Group name cannot be empty"
 
         ports_list = ports.split(",")
-        assert (
-            len(ports_list) == self.tp_size
-        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        assert len(ports_list) == self.tp_size, (
+            f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        )
         group_port = ports_list[self.tp_rank]
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
@@ -980,15 +989,15 @@ class ModelRunner:
         ports,
         group_name,
     ):
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
+        assert torch.distributed.is_initialized(), (
+            "Default torch process group must be initialized"
+        )
         assert group_name != "", "Group name cannot be empty"
 
         ports_list = ports.split(",")
-        assert (
-            len(ports_list) == self.tp_size
-        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        assert len(ports_list) == self.tp_size, (
+            f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        )
         group_port = ports_list[self.tp_rank]
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
@@ -1040,9 +1049,9 @@ class ModelRunner:
         weights/parameters online, and broadcasts them to the inference
         engine through the `_model_update_group` process group.
         """
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
+        assert torch.distributed.is_initialized(), (
+            "Default torch process group must be initialized"
+        )
         assert group_name != "", "Group name cannot be empty"
 
         rank = rank_offset + self.tp_rank
@@ -2061,12 +2070,27 @@ class ModelRunner:
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
-        )
+
+        # ==========
+        # begin of soft thinking
+        # ==========
+        if self.enable_soft_thinking:
+            return self.model.forward(
+                None,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
+        else:
+            return self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
+        # ==========
+        # end of soft thinking
+        # ==========
 
     def forward_extend(
         self,
@@ -2252,6 +2276,10 @@ class ModelRunner:
 
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
         # Sample the next tokens
+        # ==========
+        # begin of soft thinking
+        # ==========
+
         next_token_ids = self.sampler(
             logits_output,
             forward_batch.sampling_info,
@@ -2264,7 +2292,14 @@ class ModelRunner:
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
+            enable_soft_thinking=self.enable_soft_thinking,
+            add_noise_gumbel_softmax=self.add_noise_gumbel_softmax,
+            add_noise_dirichlet=self.add_noise_dirichlet,
         )
+
+        # ==========
+        # end of soft thinking
+        # ==========
         return next_token_ids
 
     def compute_logprobs_only(

@@ -37,7 +37,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
@@ -318,6 +317,15 @@ class ForwardBatch:
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
+    # ==========
+    # begin of soft thinking
+    # ==========
+    topk_probs: Optional[torch.Tensor] = None
+    topk_indices: Optional[torch.Tensor] = None
+    # ==========
+    # end of soft thinking
+    # ==========
+
     @classmethod
     def init_new(
         cls,
@@ -360,6 +368,14 @@ class ForwardBatch:
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
+            # ==========
+            # begin of soft thinking
+            # ==========
+            topk_probs=batch.topk_probs,
+            topk_indices=batch.topk_indices,
+            # ==========
+            # end of soft thinking
+            # ==========
         )
         device = model_runner.device
 
@@ -801,7 +817,6 @@ class ForwardBatch:
             )
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
-
         self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
         self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
         bs = self.batch_size
@@ -880,12 +895,11 @@ class ForwardBatch:
     # Called before each attention module if using chunked kv cache for prefill
     # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
     def prepare_chunked_prefix_cache_info(self, device: torch.device):
-
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
-        assert isinstance(
-            self.token_to_kv_pool, MLATokenToKVPool
-        ), "Currently chunked prefix cache can only be used by Deepseek models"
+        assert isinstance(self.token_to_kv_pool, MLATokenToKVPool), (
+            "Currently chunked prefix cache can only be used by Deepseek models"
+        )
 
         if not any(self.extend_prefix_lens_cpu):
             self.num_prefix_chunks = 0

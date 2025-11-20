@@ -38,7 +38,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.lora.lora_registry import LoRARegistry
@@ -401,6 +400,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             ]
         )
         self.init_communicators(server_args)
+
+        # ==========
+        # begin of soft thinking
+        # ==========
+        self.enable_soft_thinking = server_args.enable_soft_thinking
+        # ==========
+        # end of soft thinking
+        # ==========
 
     async def generate_request(
         self,
@@ -1248,9 +1255,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
     def auto_create_handle_loop(self):
         if self._chosen_loop is not None:
-            assert (
-                asyncio.get_event_loop() == self._chosen_loop
-            ), f"Please ensure only one event loop is ever used with SGLang. Previous loop: {self._chosen_loop}, current loop: {asyncio.get_event_loop()}"
+            assert asyncio.get_event_loop() == self._chosen_loop, (
+                f"Please ensure only one event loop is ever used with SGLang. Previous loop: {self._chosen_loop}, current loop: {asyncio.get_event_loop()}"
+            )
             return
 
         loop = asyncio.get_event_loop()
@@ -1329,7 +1336,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if not data_to_dump:
             return
 
-        object_name = f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl'
+        object_name = f"crash_dump_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pkl"
         filename = os.path.join(
             self.crash_dump_folder,
             os.getenv("HOSTNAME", None),
@@ -1467,6 +1474,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     recv_obj,
                     i,
                 )
+
+            # ==========
+            # begin of soft thinking
+            # ==========
+            if self.enable_soft_thinking:
+                meta_info["output_topk_prob_list"] = recv_obj.output_topk_probs_list[i]
+                meta_info["output_topk_idx_list"] = recv_obj.output_topk_indices_list[i]
+            # ==========
+            # end of soft thinking
+            # ==========
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(

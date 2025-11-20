@@ -15,12 +15,11 @@
 # Adapted from llama2.py
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
+
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
-from torch import nn
-
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -51,6 +50,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
+from torch import nn
 
 Qwen2Config = None
 
@@ -84,8 +84,7 @@ class Qwen2MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -323,6 +322,14 @@ class Qwen2Model(nn.Module):
         # For EAGLE3 support
         self.layers_to_capture = []
 
+        # ==========
+        # begin of soft thinking
+        # ==========
+        self.tp_size = get_tensor_model_parallel_world_size()
+        # ==========
+        # end of soft thinking
+        # ==========
+
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
             return self.get_input_embeddings()(input_ids) * self.config.scale_emb
@@ -340,12 +347,29 @@ class Qwen2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-
         if self.pp_group.is_first_rank:
-            if input_embeds is None:
+            # ==========
+            # begin of soft thinking
+            # ==========
+            if (
+                forward_batch.topk_probs is not None
+                and forward_batch.topk_indices is not None
+            ):
+                if self.tp_size > 1:
+                    hidden_states = self.embed_tokens.weighted_forward_tp(
+                        forward_batch.topk_probs, forward_batch.topk_indices
+                    )
+                else:
+                    hidden_states = self.embed_tokens.weighted_forward(
+                        forward_batch.topk_probs, forward_batch.topk_indices
+                    )
+            elif input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
+            # ==========
+            # end of soft thinking
+            # ==========
             residual = None
         else:
             assert pp_proxy_tensors is not None
@@ -404,7 +428,7 @@ class Qwen2Model(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 

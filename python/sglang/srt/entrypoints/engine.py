@@ -36,7 +36,6 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import torch
 import uvloop
-
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -277,7 +276,7 @@ class Engine(EngineBase):
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
                 raise ValueError(
-                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
+                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size - 1}]"
                 )
 
         logger.debug(f"data_parallel_rank: {data_parallel_rank}")
