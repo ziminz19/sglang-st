@@ -2586,30 +2586,6 @@ class ServerArgs:
             help="json-formatted sampling settings that will be returned in /get_model_info",
         )
 
-        # ==========
-        # begin of soft thinking
-        # ==========
-        # Soft thinking mode
-        parser.add_argument(
-            "--enable-soft-thinking",
-            action="store_true",
-            help="Enable soft thinking mode",
-        )
-
-        parser.add_argument(
-            "--think-end-str",
-            type=str,
-            default="</think>",
-        )
-        parser.add_argument(
-            "--max-topk",
-            type=int,
-            default=ServerArgs.max_topk,
-        )
-        # ==========
-        # end of soft thinking
-        # ==========
-
         # LoRA
         parser.add_argument(
             "--enable-lora",
@@ -3663,6 +3639,39 @@ class ServerArgs:
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
         )
+
+        # ==========
+        # begin of soft thinking
+        # ==========
+        # Soft thinking mode
+        parser.add_argument(
+            "--enable-soft-thinking",
+            action="store_true",
+            help="Enable soft thinking mode",
+        )
+        parser.add_argument(
+            "--think-end-str",
+            type=str,
+            default="</think>",
+        )
+        parser.add_argument(
+            "--max-topk",
+            type=int,
+            default=ServerArgs.max_topk,
+        )
+        parser.add_argument(
+            "--add-noise-dirichlet",
+            action="store_true",
+            help="Add dirichlet noise for soft thinking",
+        )
+        parser.add_argument(
+            "--add-noise-gumbel-softmax",
+            action="store_true",
+            help="Add gumbel-softmax noise for soft thinking",
+        )
+        # ==========
+        # end of soft thinking
+        # ==========
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
