@@ -4,9 +4,8 @@ import dataclasses
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-import torch
-
 import sglang.srt.sampling.penaltylib as penaltylib
+import torch
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -28,6 +27,15 @@ class SamplingBatchInfo:
 
     # Whether all requests use greedy sampling
     is_all_greedy: bool
+
+    # ==========
+    # begin of soft thinking
+    # ==========
+    is_all_no_noise: bool
+    need_after_thinking_min_p_sampling: bool
+    # ==========
+    # end of soft thinking
+    # ==========
 
     # Whether any requests use top_p sampling
     need_top_p_sampling: bool
@@ -66,6 +74,31 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    # ==========
+    # begin of soft thinking
+    # ==========
+
+    enable_soft_thinking: bool = False
+    soft_thinking_modes: Optional[torch.Tensor] = None
+    max_topk: Optional[int] = None
+    # After thinking sampling params
+    after_thinking_temperatures: Optional[torch.Tensor] = None
+    after_thinking_top_ps: Optional[torch.Tensor] = None
+    after_thinking_top_ks: Optional[torch.Tensor] = None
+    after_thinking_min_ps: Optional[torch.Tensor] = None
+    early_stopping_entropy_threshold: Optional[torch.Tensor] = None
+    early_stopping_length_threshold: Optional[torch.Tensor] = None
+
+    # Dirichlet sampling parameters
+    add_noise_dirichlet: Optional[bool] = None
+    dirichlet_alphas: Optional[torch.Tensor] = None
+    # Gumbel-softmax sampling parameters
+    add_noise_gumbel_softmax: Optional[bool] = None
+    gumbel_softmax_temperatures: Optional[torch.Tensor] = None
+    # ==========
+    # end of soft thinking
+    # ==========
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args = get_global_server_args()
@@ -96,6 +129,50 @@ class SamplingBatchInfo:
             if enable_deterministic
             else None
         )
+
+        # ==========
+        # begin of soft thinking
+        # ==========
+        after_thinking_temperatures = (
+            torch.tensor(
+                [r.sampling_params.after_thinking_temperature for r in reqs],
+                dtype=torch.float,
+            )
+            .view(-1, 1)
+            .to(device, non_blocking=True)
+        )
+        after_thinking_top_ps = torch.tensor(
+            [r.sampling_params.after_thinking_top_p for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
+        after_thinking_top_ks = torch.tensor(
+            [r.sampling_params.after_thinking_top_k for r in reqs], dtype=torch.int32
+        ).to(device, non_blocking=True)
+        after_thinking_min_ps = torch.tensor(
+            [r.sampling_params.after_thinking_min_p for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
+        dirichlet_alphas = torch.tensor(
+            [r.sampling_params.dirichlet_alpha for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
+        early_stopping_entropy_threshold = torch.tensor(
+            [r.sampling_params.early_stopping_entropy_threshold for r in reqs],
+            dtype=torch.float,
+        ).to(device, non_blocking=True)
+        early_stopping_length_threshold = torch.tensor(
+            [r.sampling_params.early_stopping_length_threshold for r in reqs],
+            dtype=torch.int32,
+        ).to(device, non_blocking=True)
+        # Gumbel-softmax sampling parameters
+        gumbel_softmax_temperatures = (
+            torch.tensor(
+                [r.sampling_params.gumbel_softmax_temperature for r in reqs],
+                dtype=torch.float,
+            )
+            .view(-1, 1)
+            .to(device, non_blocking=True)
+        )
+        # ==========
+        # end of soft thinking
+        # ==========
 
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
@@ -155,12 +232,52 @@ class SamplingBatchInfo:
             },
         )
 
+        # ==========
+        # begin of soft thinking
+        # ==========
+        enable_soft_thinking = batch.enable_soft_thinking
+        if enable_soft_thinking:
+            soft_thinking_modes = torch.tensor(
+                [req.sampling_params.soft_thinking_mode for req in reqs],
+                dtype=torch.bool,
+            ).to(device, non_blocking=True)
+            max_topk = batch.max_topk
+        else:
+            soft_thinking_modes = None
+            max_topk = None
+        # ==========
+        # end of soft thinking
+        # ==========
+
         ret = cls(
             temperatures=temperatures,
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
+            # ==========
+            # begin of soft thinking
+            # ==========
+            after_thinking_temperatures=after_thinking_temperatures,
+            after_thinking_top_ps=after_thinking_top_ps,
+            after_thinking_top_ks=after_thinking_top_ks,
+            after_thinking_min_ps=after_thinking_min_ps,
+            early_stopping_entropy_threshold=early_stopping_entropy_threshold,
+            early_stopping_length_threshold=early_stopping_length_threshold,
+            is_all_no_noise=False,
+            need_after_thinking_min_p_sampling=any(
+                r.sampling_params.after_thinking_min_p > 0 for r in reqs
+            ),
+            enable_soft_thinking=batch.enable_soft_thinking,
+            soft_thinking_modes=soft_thinking_modes,
+            max_topk=max_topk,
+            # Dirichlet sampling parameters
+            dirichlet_alphas=dirichlet_alphas,
+            # Gumbel-softmax sampling parameters
+            gumbel_softmax_temperatures=gumbel_softmax_temperatures,
+            # ==========
+            # end of soft thinking
+            # ==========
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
@@ -237,13 +354,32 @@ class SamplingBatchInfo:
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
 
-        for item in [
+        # ==========
+        # begin of soft thinking
+        # ==========
+        filter_list = [
             "temperatures",
             "top_ps",
             "top_ks",
             "min_ps",
             "sampling_seed",
-        ]:
+        ]
+
+        if self.enable_soft_thinking:
+            filter_list.append("soft_thinking_modes")
+            filter_list.append("after_thinking_temperatures")
+            filter_list.append("after_thinking_top_ps")
+            filter_list.append("after_thinking_top_ks")
+            filter_list.append("after_thinking_min_ps")
+            filter_list.append("dirichlet_alphas")
+            filter_list.append("early_stopping_entropy_threshold")
+            filter_list.append("early_stopping_length_threshold")
+            filter_list.append("gumbel_softmax_temperatures")
+        # ==========
+        # end of soft thinking
+        # ==========
+
+        for item in filter_list:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
@@ -343,13 +479,33 @@ class SamplingBatchInfo:
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
-        for item in [
+
+        # ==========
+        # begin of soft thinking
+        # ==========
+        merge_list = [
             "temperatures",
             "top_ps",
             "top_ks",
             "min_ps",
             "sampling_seed",
-        ]:
+        ]
+
+        if self.enable_soft_thinking:
+            merge_list.append("soft_thinking_modes")
+            merge_list.append("after_thinking_temperatures")
+            merge_list.append("after_thinking_top_ps")
+            merge_list.append("after_thinking_top_ks")
+            merge_list.append("after_thinking_min_ps")
+            merge_list.append("dirichlet_alphas")
+            merge_list.append("early_stopping_entropy_threshold")
+            merge_list.append("early_stopping_length_threshold")
+            merge_list.append("gumbel_softmax_temperatures")
+        # ==========
+        # end of soft thinking
+        # ==========
+
+        for item in merge_list:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
@@ -359,6 +515,17 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+
+        # ==========
+        # begin of soft thinking
+        # ==========
+        self.is_all_no_noise |= other.is_all_no_noise
+        self.need_after_thinking_min_p_sampling |= (
+            other.need_after_thinking_min_p_sampling
+        )
+        # ==========
+        # end of soft thinking
+        # ==========
 
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later

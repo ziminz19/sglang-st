@@ -17,6 +17,8 @@ import logging
 import sre_parse
 from typing import Any, Dict, List, Optional, Union
 
+import torch
+
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
 
@@ -42,6 +44,21 @@ class SamplingParams:
         top_p: float = 1.0,
         top_k: int = -1,
         min_p: float = 0.0,
+        # ==========
+        # begin of soft thinking
+        # ==========
+        after_thinking_temperature: float = 1.0,
+        after_thinking_top_p: float = 1.0,
+        after_thinking_top_k: int = -1,
+        after_thinking_min_p: float = 0.0,
+        dirichlet_alpha: float = 1.0,
+        early_stopping_entropy_threshold: float = 0.0,
+        early_stopping_length_threshold: int = 200,
+        think_end_str: Optional[str] = None,
+        gumbel_softmax_temperature: float = 1.0,
+        # ==========
+        # end of soft thinking
+        # ==========
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
@@ -71,6 +88,24 @@ class SamplingParams:
         self.top_p = top_p
         self.top_k = top_k
         self.min_p = min_p
+        # ==========
+        # begin of soft thinking
+        # ==========
+        self.after_thinking_temperature = after_thinking_temperature
+        self.after_thinking_top_p = after_thinking_top_p
+        self.after_thinking_top_k = after_thinking_top_k
+        self.after_thinking_min_p = after_thinking_min_p
+        self.early_stopping_entropy_threshold = early_stopping_entropy_threshold
+        self.early_stopping_length_threshold = early_stopping_length_threshold
+        self.soft_thinking_mode = None
+        self.think_end_str = think_end_str
+        # Dirichlet sampling parameters
+        self.dirichlet_alpha = dirichlet_alpha
+        # Gumbel-softmax sampling parameters
+        self.gumbel_softmax_temperature = gumbel_softmax_temperature
+        # ==========
+        # end of soft thinking
+        # ==========
         self.frequency_penalty = frequency_penalty
         self.presence_penalty = presence_penalty
         self.repetition_penalty = repetition_penalty
@@ -94,6 +129,17 @@ class SamplingParams:
             # top_k = 1 means greedy sampling
             self.temperature = 1.0
             self.top_k = 1
+        # ==========
+        # begin of soft thinking
+        # ==========
+        if 0 <= self.after_thinking_temperature < _SAMPLING_EPS:
+            self.after_thinking_temperature = 1.0
+            self.after_thinking_top_k = 1
+        if self.after_thinking_top_k == -1:
+            self.after_thinking_top_k = 1 << 30  # whole vocabulary
+        # ==========
+        # end of soft thinking
+        # ==========
         if self.top_k == -1:
             self.top_k = TOP_K_ALL  # whole vocabulary
 
@@ -110,19 +156,45 @@ class SamplingParams:
             raise ValueError(
                 f"top_k must be -1 (disable) or at least 1, got {self.top_k}."
             )
+
+        # ==========
+        # begin of soft thinking
+        # ==========
+        if self.after_thinking_temperature < 0.0:
+            raise ValueError(
+                f"after_thinking_temperature must be non-negative, got {self.after_thinking_temperature}."
+            )
+        if not 0.0 < self.after_thinking_top_p <= 1.0:
+            raise ValueError(
+                f"after_thinking_top_p must be in (0, 1], got {self.after_thinking_top_p}."
+            )
+        if not 0.0 <= self.after_thinking_min_p <= 1.0:
+            raise ValueError(
+                f"after_thinking_min_p must be in [0, 1], got {self.after_thinking_min_p}."
+            )
+        if self.after_thinking_top_k < 1 or self.after_thinking_top_k == -1:
+            raise ValueError(
+                f"after_thinking_top_k must be -1 (disable) or at least 1, got {self.after_thinking_top_k}."
+            )
+        if self.dirichlet_alpha < 0.0:
+            raise ValueError(
+                f"dirichlet_alpha must be non-negative, got {self.dirichlet_alpha}."
+            )
+        # ==========
+        # end of soft thinking
+        # ==========
+
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
-                "frequency_penalty must be in [-2, 2], got "
-                f"{self.frequency_penalty}."
+                f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}."
             )
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(
-                "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
+                f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
             )
         if not 0.0 <= self.repetition_penalty <= 2.0:
             raise ValueError(
-                "repetition_penalty must be in [0, 2], got "
-                f"{self.repetition_penalty}."
+                f"repetition_penalty must be in [0, 2], got {self.repetition_penalty}."
             )
         if not 0 <= self.min_new_tokens:
             raise ValueError(
@@ -190,6 +262,10 @@ class SamplingParams:
                 )
 
             self.stop_regex_max_len = stop_regex_max_len
+
+    def post_init_soft_thinking_mode(self):
+        # TODO: 换成cpu的，然后init的时候再传输，topk也是一样，会造成主卡显存不足
+        self.soft_thinking_mode = torch.tensor(True, dtype=torch.bool, device="cuda")
 
 
 # This function gets a strict upperbound on the maximum number of tokens that would need
